@@ -79,12 +79,20 @@ macos_build() { sw_vers -buildVersion 2>/dev/null; }
 sc_show() { echo "show $1" | scutil 2>/dev/null; }
 sc_has() { sc_show "$1" | grep -q "$2"; }
 
-# The real network service: first in ServiceOrder that has IPv4 with a router.
-# We use it instead of Global/IPv4 because our own service changes the global keys.
+# The real network service: the one macOS itself picked as primary for IPv4. That already
+# includes the user's service order, link state and router. Our own service never wins IPv4
+# (it is not in the service order), but if it ever does, fall back to the user's service order
+# from the network settings.
+has_router() { sc_show "State:/Network/Service/$1/IPv4" | awk '$1=="Router"{f=1} END{exit !f}'; }
 real_svc() {
 	local s
+	s=$(sc_show State:/Network/Global/IPv4 | awk '$1=="PrimaryService"{print $3; exit}')
+	if [ -n "$s" ] && [ "$s" != "$SC_KEY" ] && has_router "$s"; then
+		echo "$s"
+		return
+	fi
 	for s in $(sc_show Setup:/Network/Global/IPv4 | awk '/^ *[0-9]+ :/{print $3}'); do
-		sc_show "State:/Network/Service/$s/IPv4" | awk '$1=="Router"{f=1} END{exit !f}' && {
+		has_router "$s" && {
 			echo "$s"
 			return
 		}
@@ -217,8 +225,18 @@ EOF
 	[ -z "$MIRROR_SIG" ] && log "tunnel IPv6 registered in the system (network service $s)"
 	MIRROR_SIG=$sig
 	# Safety fuse: IPv4 must stay on the real network. If a new macOS behaves differently,
-	# roll back right away and do not try again on this macOS build.
-	sleep 2
+	# roll back right away and do not try again on this macOS build. Give macOS a few seconds
+	# to settle, and never blow the fuse while the network itself is changing (a cable plugged
+	# in, Wi-Fi roaming): then the next check simply publishes again.
+	local try
+	for try in 1 2 3; do
+		sleep 2
+		v4_on_real_iface && return 0
+		if [ "$(real_svc)" != "$s" ]; then
+			MIRROR_SIG=""
+			return 0
+		fi
+	done
 	if ! v4_on_real_iface; then
 		sc_unpublish
 		macos_build >"$MIRROR_OFF"
