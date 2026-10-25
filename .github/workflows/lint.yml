@@ -19,4 +19,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: mfinelli/setup-shfmt@v3
-      - run: shfmt -d ipv6-auto-install.sh ipv6-auto
+      - run: shfmt -d ipv6-install.sh ipv6-auto

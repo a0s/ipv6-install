@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Automatic IPv6 for macOS: WireGuard tunnel when the network has no IPv6
-# https://github.com/a0s/ipv6-auto-install
+# https://github.com/a0s/ipv6-install
 
-readonly VERSION="0.1.0"
-readonly REPO_RAW="https://raw.githubusercontent.com/a0s/ipv6-auto-install/master"
+readonly VERSION="0.1.1"
+readonly REPO_RAW="https://raw.githubusercontent.com/a0s/ipv6-install/master"
 readonly ETC_DIR="/usr/local/etc/ipv6-auto"
 readonly CONF="${ETC_DIR}/wg6.conf"
 readonly PARAMS="${ETC_DIR}/params"
@@ -71,7 +71,7 @@ function ask() {
 
 function installQuestions() {
 	echo "Welcome to the ipv6-auto installer!"
-	echo "The git repository is available at: https://github.com/a0s/ipv6-auto-install"
+	echo "The git repository is available at: https://github.com/a0s/ipv6-install"
 	echo ""
 	echo "When your Mac joins a network without IPv6, ipv6-auto brings up a WireGuard tunnel"
 	echo "to an IPv6 tunnel broker. On networks with native IPv6 the tunnel goes away."
@@ -198,8 +198,8 @@ function fetchDaemon() {
 	here=$(cd "$(dirname "${self}")" 2>/dev/null && pwd)
 	if [ -f "${here}/ipv6-auto" ]; then
 		cp "${here}/ipv6-auto" "$1"
-	elif [ -f "${here}/../share/ipv6-auto/ipv6-auto" ]; then
-		cp "${here}/../share/ipv6-auto/ipv6-auto" "$1"
+	elif [ -f "${here}/../share/ipv6-install/ipv6-auto" ]; then
+		cp "${here}/../share/ipv6-install/ipv6-auto" "$1"
 	elif ! curl -fsSL "${REPO_RAW}/ipv6-auto" -o "$1"; then
 		echo -e "${RED}Failed to download ${REPO_RAW}/ipv6-auto${NC}"
 		exit 1
@@ -324,8 +324,8 @@ function uninstallIPv6Auto() {
 }
 
 function manageMenu() {
-	echo "Welcome to ipv6-auto-install!"
-	echo "The git repository is available at: https://github.com/a0s/ipv6-auto-install"
+	echo "Welcome to ipv6-install!"
+	echo "The git repository is available at: https://github.com/a0s/ipv6-install"
 	echo ""
 	echo "It looks like ipv6-auto is already installed."
 	echo ""
@@ -351,7 +351,7 @@ function manageMenu() {
 
 case "${1:-}" in
 --version)
-	echo "ipv6-auto-install ${VERSION}"
+	echo "ipv6-install ${VERSION}"
 	exit 0
 	;;
 --help | -h)

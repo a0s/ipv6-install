@@ -2,7 +2,7 @@
 # shellcheck disable=SC2155
 #
 # ipv6-auto: automatic IPv6 for macOS.
-# https://github.com/a0s/ipv6-auto-install
+# https://github.com/a0s/ipv6-install
 #
 # If the current network has no IPv6, bring up a WireGuard tunnel to an IPv6 tunnel broker.
 # If the network has native IPv6, take the tunnel down and use the native one.

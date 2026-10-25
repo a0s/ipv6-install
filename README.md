@@ -1,15 +1,17 @@
-# ipv6-auto-install
+# ipv6-install
 
-![Lint](https://github.com/a0s/ipv6-auto-install/workflows/Lint/badge.svg)
+![Lint](https://github.com/a0s/ipv6-install/workflows/Lint/badge.svg)
 
 **A bash script that gives a Mac IPv6 on networks that don't have it.**
 
-When your Mac joins Wi-Fi without IPv6 (a café, a hotel, most offices), ipv6-auto brings up a
-WireGuard tunnel to an IPv6 tunnel broker. When you join a network with native IPv6, the tunnel
+When your Mac joins Wi-Fi without IPv6 (a café, a hotel, most offices), a small daemon brings up
+a WireGuard tunnel to an IPv6 tunnel broker. When you join a network with native IPv6, the tunnel
 goes down and you use the native one. You never have to touch it.
 
-Inspired by [openvpn-install](https://github.com/angristan/openvpn-install) and
-[wireguard-install](https://github.com/angristan/wireguard-install).
+Inspired by [openvpn-install](https://github.com/angristan/openvpn-install),
+[wireguard-install](https://github.com/angristan/wireguard-install) and
+[3proxy-install](https://github.com/a0s/3proxy-install): one script, a few questions, and it
+works.
 
 ## Requirements
 
@@ -22,19 +24,19 @@ Inspired by [openvpn-install](https://github.com/angristan/openvpn-install) and
 ## Usage
 
 ```bash
-curl -O https://raw.githubusercontent.com/a0s/ipv6-auto-install/master/ipv6-auto-install.sh
-sudo bash ipv6-auto-install.sh
+curl -O https://raw.githubusercontent.com/a0s/ipv6-install/master/ipv6-install.sh
+sudo bash ipv6-install.sh
 ```
 
-It asks where the config is and how you want IPv6 used, installs a LaunchDaemon and runs a
-self-test at the end. Run it again to see status, run the self-test, swap the config or remove
-everything. `sudo bash ipv6-auto-install.sh --uninstall` removes it without the menu.
+It asks where the config is and how you want IPv6 used, installs the `ipv6-auto` LaunchDaemon
+and runs a self-test at the end. Run it again to see status, run the self-test, swap the config
+or remove everything. `sudo bash ipv6-install.sh --uninstall` removes it without the menu.
 
 With Homebrew:
 
 ```bash
-brew install a0s/ipv6-auto/ipv6-auto
-sudo ipv6-auto-install
+brew install a0s/ipv6-install/ipv6-install
+sudo ipv6-install
 ```
 
 After that:
@@ -64,7 +66,7 @@ there is a primary IPv6 service, and a utun interface isn't one, so apps never s
 addresses. If you make the tunnel primary, macOS hands it IPv4 and DNS as well and your IPv4
 default route disappears. WireGuard.app with `::/0` does the same thing.
 
-ipv6-auto publishes its own service in SystemConfiguration. The IPv6 part points at the tunnel
+The daemon publishes its own service in SystemConfiguration. The IPv6 part points at the tunnel
 and the IPv4, DNS and proxy parts are copies of your real network, refreshed on every change.
 macOS sees one service with IPv4 through your router and IPv6 through the tunnel.
 
@@ -93,4 +95,4 @@ issue first if you want to discuss a larger change.
 
 ## Credits & Licence
 
-This project is under the [MIT Licence](https://raw.githubusercontent.com/a0s/ipv6-auto-install/master/LICENSE)
+This project is under the [MIT Licence](https://raw.githubusercontent.com/a0s/ipv6-install/master/LICENSE)
