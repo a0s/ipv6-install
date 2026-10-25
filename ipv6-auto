@@ -1,0 +1,510 @@
+#!/opt/homebrew/bin/bash
+# shellcheck disable=SC2155
+#
+# ipv6-auto: automatic IPv6 for macOS.
+# https://github.com/a0s/ipv6-auto-install
+#
+# If the current network has no IPv6, bring up a WireGuard tunnel to an IPv6 tunnel broker.
+# If the network has native IPv6, take the tunnel down and use the native one.
+#
+#   ipv6-auto daemon     wait for network events from macOS (run by the LaunchDaemon)
+#   ipv6-auto status     show what is going on
+#   ipv6-auto selftest   check that everything works (runs by itself after macOS updates)
+#   ipv6-auto check      run a single check (debugging)
+#   ipv6-auto cleanup    take the tunnel down and remove our SystemConfiguration keys
+#
+# Why the "mirror": macOS only asks DNS for AAAA records (so apps only use IPv6) when there is
+# a primary IPv6 service. The tunnel becomes primary via OverridePrimary, but then macOS takes
+# IPv4 and DNS from it as well. So we copy IPv4, DNS and proxies of the real network into our
+# service. To macOS it is one service: IPv4 via the router, IPv6 via the tunnel.
+
+export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+ETC=/usr/local/etc/ipv6-auto
+CONF=$ETC/wg6.conf # WireGuard config, IPv6 only
+PARAMS=$ETC/params # settings written by the installer
+NAME=wg6           # tunnel name (= config file name)
+LOG=/var/log/ipv6-auto.log
+SC_KEY=ipv6-auto # our service in SystemConfiguration
+BUILD_FILE=$ETC/last-macos-build
+MIRROR_OFF=$ETC/mirror-disabled
+
+# Defaults, may be overridden in $PARAMS
+MIRROR=yes        # register tunnel IPv6 in the system so apps prefer it
+YIELD_TO_VPN=yes  # take the tunnel down while another system VPN is connected
+IDLE_CHECK=300    # sanity check every 5 minutes when nothing happens
+SOON=30           # "check again soon" (dark wake, network not ready)
+UP_CONFIRM=2      # checks in a row without IPv6 before the tunnel goes up
+BROKEN_TTL=1800   # native IPv6 that does not work is ignored for 30 minutes
+HANDSHAKE_MAX=180 # restart the tunnel after this long without a handshake
+TEST_HOST=2001:4860:4860::8888
+# shellcheck source=/dev/null
+[ -r "$PARAMS" ] && . "$PARAMS"
+
+BROKEN_KEY=""
+BROKEN_UNTIL=0
+NO_NATIVE_COUNT=0
+LAST_RESTART=0
+FAILS=0
+NEXT_TRY=0
+NEXT_TIMEOUT=$IDLE_CHECK
+LAST_SKIP=""
+MIRROR_SIG=""
+SELFTEST_PENDING=0
+
+log() {
+	echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null
+	[ "$(stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ] && mv -f "$LOG" "$LOG.1"
+}
+# Log why a check was skipped, but only when the reason changes
+skip() {
+	[ "$LAST_SKIP" != "$1" ] && log "skip: $1"
+	LAST_SKIP=$1
+	NEXT_TIMEOUT=$SOON
+}
+
+# Notification for whoever sits at the screen (the daemon runs as root)
+notify() {
+	local u uid msg=${1//\"/\'}
+	u=$(stat -f %Su /dev/console 2>/dev/null)
+	{ [ -z "$u" ] || [ "$u" = root ]; } && return
+	uid=$(id -u "$u") || return
+	launchctl asuser "$uid" sudo -u "$u" osascript \
+		-e "display notification \"$msg\" with title \"ipv6-auto\"" >/dev/null 2>&1 &
+}
+
+macos_build() { sw_vers -buildVersion 2>/dev/null; }
+sc_show() { echo "show $1" | scutil 2>/dev/null; }
+sc_has() { sc_show "$1" | grep -q "$2"; }
+
+# The real network service: first in ServiceOrder that has IPv4 with a router.
+# We use it instead of Global/IPv4 because our own service changes the global keys.
+real_svc() {
+	local s
+	for s in $(sc_show Setup:/Network/Global/IPv4 | awk '/^ *[0-9]+ :/{print $3}'); do
+		sc_show "State:/Network/Service/$s/IPv4" | awk '$1=="Router"{f=1} END{exit !f}' && {
+			echo "$s"
+			return
+		}
+	done
+}
+svc_v4() { sc_show "State:/Network/Service/$(real_svc)/IPv4"; }
+primary_if() { svc_v4 | awk '$1=="InterfaceName"{print $3; exit}'; }
+router4() { svc_v4 | awk '$1=="Router"{print $3; exit}'; }
+
+# Full wake? During dark wake (Power Nap, maintenance) there is no graphics capability:
+# bit 0x2 of "System Capabilities" in IOPMrootDomain. If unknown, assume awake.
+full_wake() {
+	local c=$(ioreg -n IOPMrootDomain -d1 -r 2>/dev/null | awk -F'= ' '/"System Capabilities"/{print $2; exit}')
+	[ -z "$c" ] && return 0
+	((c & 2))
+}
+
+# Network is ready: real service with an interface, a router and a usable (non 169.254) address
+net_ready() {
+	local ifc=$(primary_if) r=$(router4)
+	[ -n "$ifc" ] && [ -n "$r" ] || return 1
+	ifconfig "$ifc" 2>/dev/null | awk '$1=="inet" && $2 !~ /^169\.254\./ {f=1} END {exit !f}'
+}
+
+# Network identity: interface + IPv4 router + router MAC (SSID needs extra permissions on new macOS)
+net_key() {
+	local r=$(router4)
+	echo "$(primary_if)|$r|$(arp -n "$r" 2>/dev/null | awk '{print $4}')"
+}
+
+# The network provides IPv6: global address on the interface and an IPv6 default route
+native_v6_present() {
+	local ifc=$(primary_if)
+	[ -n "$ifc" ] || return 1
+	case "$ifc" in utun* | gif* | ipsec* | ppp*) return 1 ;; esac
+	ifconfig "$ifc" 2>/dev/null | awk '
+		$1=="inet6" && $2 !~ /^fe80/ && $2 !~ /^f[cd]/ && !/detached|deprecated|duplicated|tentative/ {f=1}
+		END {exit !f}' || return 1
+	netstat -rn -f inet6 2>/dev/null | awk -v i="$ifc" '$1=="default" && $NF==i {f=1} END {exit !f}'
+}
+
+v6_works() { ping6 -c 2 -i 0.5 -t 4 "$TEST_HOST" >/dev/null 2>&1 || curl -6 -s -m 5 -o /dev/null https://ipv6.google.com; }
+
+tun_ifname() { cat "/var/run/wireguard/$NAME.name" 2>/dev/null; }
+tun_is_up() {
+	local i=$(tun_ifname)
+	[ -n "$i" ] && wg show "$i" >/dev/null 2>&1
+}
+
+# Another system VPN is connected (e.g. a WireGuard.app tunnel). Cloudflare WARP is not listed here.
+other_vpn() {
+	[ "$YIELD_TO_VPN" = yes ] || return
+	scutil --nc list 2>/dev/null | awk -F'"' '/\(Connected\)/{print $2; exit}'
+}
+
+# --- mirror in SystemConfiguration ---------------------------------------------------------
+
+# Print source keys for DNS and proxies (Setup overrides State)
+mirror_sources() {
+	local s=$1 e k
+	for e in DNS Proxies; do
+		k=Setup:/Network/Service/$s/$e
+		sc_has "$k" '<dictionary>' || k=State:/Network/Service/$s/$e
+		sc_has "$k" '<dictionary>' && echo "$e $k"
+	done
+}
+
+# IPv4 default route still goes via the real interface
+v4_on_real_iface() {
+	local ifc=$(primary_if) g d
+	g=$(sc_show State:/Network/Global/IPv4 | awk '$1=="PrimaryInterface"{print $3; exit}')
+	d=$(route -n get default 2>/dev/null | awk '$1=="interface:"{print $2; exit}')
+	[ -n "$ifc" ] && [ "$g" = "$ifc" ] && [ "$d" = "$ifc" ]
+}
+
+mirror_allowed() { [ "$MIRROR" = yes ] && [ "$(cat "$MIRROR_OFF" 2>/dev/null)" != "$(macos_build)" ]; }
+
+sc_publish() {
+	local s=$(real_svc) i=$(tun_ifname) a src sig cmds e k
+	a=$(ifconfig "$i" 2>/dev/null | awk '$1=="inet6" && $2 !~ /^fe80/ {print $2; exit}')
+	[ -n "$s" ] && [ -n "$a" ] || return 1
+	src=$(mirror_sources "$s")
+	sig=$({
+		sc_show "State:/Network/Service/$s/IPv4"
+		echo "$src"
+		echo "$src" | while read -r _ k; do sc_show "$k"; done
+		echo "$i $a"
+	} | md5 -q)
+	[ "$sig" = "$MIRROR_SIG" ] && return 0
+	cmds="get State:/Network/Service/$s/IPv4
+set State:/Network/Service/$SC_KEY/IPv4"
+	for e in DNS Proxies; do
+		k=$(echo "$src" | awk -v e=$e '$1==e{print $2}')
+		if [ -n "$k" ]; then
+			cmds+="
+get $k
+set State:/Network/Service/$SC_KEY/$e"
+		else
+			cmds+="
+remove State:/Network/Service/$SC_KEY/$e"
+		fi
+	done
+	scutil >/dev/null 2>&1 <<EOF
+$cmds
+d.init
+d.add Addresses * $a
+d.add InterfaceName $i
+d.add PrefixLength * 64
+d.add Router ${a%::*}::1
+d.add OverridePrimary # 1
+set State:/Network/Service/$SC_KEY/IPv6
+EOF
+	[ -z "$MIRROR_SIG" ] && log "tunnel IPv6 registered in the system (network service $s)"
+	MIRROR_SIG=$sig
+	# Safety fuse: IPv4 must stay on the real network. If a new macOS behaves differently,
+	# roll back right away and do not try again on this macOS build.
+	sleep 2
+	if ! v4_on_real_iface; then
+		sc_unpublish
+		macos_build >"$MIRROR_OFF"
+		log "FUSE: IPv4 on $(primary_if) disappeared after registering IPv6, rolled back. Mirror disabled for build $(macos_build)"
+		notify "macOS changed how networking works. The tunnel now only serves explicit IPv6 addresses. Details: sudo ipv6-auto selftest"
+		return 1
+	fi
+}
+
+sc_unpublish() {
+	scutil >/dev/null 2>&1 <<EOF
+remove State:/Network/Service/$SC_KEY/IPv6
+remove State:/Network/Service/$SC_KEY/IPv4
+remove State:/Network/Service/$SC_KEY/DNS
+remove State:/Network/Service/$SC_KEY/Proxies
+EOF
+	MIRROR_SIG=""
+}
+
+# --- tunnel ---------------------------------------------------------------------------------
+
+tun_up() {
+	tun_is_up && return 0
+	local now=$(date +%s) out i p wait
+	if [ "$now" -lt "$NEXT_TRY" ]; then
+		NEXT_TIMEOUT=$((NEXT_TRY - now + 1))
+		return 1
+	fi
+	[ -f "$CONF" ] || {
+		skip "no config at $CONF"
+		return 1
+	}
+	log "bringing the tunnel up ($1)"
+	# leftovers from a previous run (wireguard-go killed, name file left) break wg-quick up
+	[ -f "/var/run/wireguard/$NAME.name" ] && wg-quick down "$CONF" >/dev/null 2>&1
+	rm -f "/var/run/wireguard/$NAME.name"
+	out=$(wg-quick up "$CONF" 2>&1)
+	if tun_is_up; then
+		i=$(tun_ifname)
+		# keepalive so that café NAT does not forget the UDP session (if the config has none)
+		for p in $(wg show "$i" peers 2>/dev/null); do
+			[ "$(wg show "$i" persistent-keepalive | awk -v p="$p" '$1==p{print $2}')" = off ] &&
+				wg set "$i" peer "$p" persistent-keepalive 25
+		done
+		LAST_RESTART=$now
+		FAILS=0
+		NEXT_TRY=0
+		LAST_SKIP=""
+		log "tunnel is up on $i"
+		mirror_allowed && sc_publish
+	else
+		FAILS=$((FAILS + 1))
+		wait=$((10 * 2 ** (FAILS > 5 ? 5 : FAILS))) # 20s, 40s ... up to 320s
+		NEXT_TRY=$((now + wait))
+		NEXT_TIMEOUT=$wait
+		log "failed to bring the tunnel up (attempt $FAILS, next in ${wait}s): $(echo "$out" | tail -2 | tr '\n' ' ')"
+		wg-quick down "$CONF" >/dev/null 2>&1
+		rm -f "/var/run/wireguard/$NAME.name"
+		return 1
+	fi
+}
+
+tun_down() {
+	sc_unpublish
+	[ -f "/var/run/wireguard/$NAME.name" ] || return 0
+	log "taking the tunnel down ($1)"
+	wg-quick down "$CONF" >/dev/null 2>&1 || rm -f "/var/run/wireguard/$NAME.name"
+	FAILS=0
+	NEXT_TRY=0
+}
+
+# Restart a stuck tunnel (e.g. the network changed and handshakes stopped)
+tun_health() {
+	local i=$(tun_ifname) now=$(date +%s) hs
+	[ $((now - LAST_RESTART)) -lt "$HANDSHAKE_MAX" ] && return
+	hs=$(wg show "$i" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
+	if [ -z "$hs" ] || [ "$hs" = 0 ] || [ $((now - hs)) -gt "$HANDSHAKE_MAX" ]; then
+		log "no handshake, restarting the tunnel"
+		tun_down "restart"
+		tun_up "restart"
+	fi
+}
+
+check() {
+	NEXT_TIMEOUT=$IDLE_CHECK
+	full_wake || {
+		skip "dark wake"
+		return
+	}
+	if ! net_ready; then
+		# the mirror of the old network is no longer valid; keep the tunnel itself
+		[ -n "$MIRROR_SIG" ] && sc_unpublish
+		skip "network is not ready"
+		NO_NATIVE_COUNT=0
+		return
+	fi
+	LAST_SKIP=""
+
+	local key=$(net_key) now=$(date +%s) vpn=$(other_vpn)
+	if [ -n "$vpn" ]; then
+		NO_NATIVE_COUNT=0
+		tun_is_up && tun_down "another VPN is connected: $vpn"
+		return
+	fi
+
+	if native_v6_present && ! { [ "$key" = "$BROKEN_KEY" ] && [ "$now" -lt "$BROKEN_UNTIL" ]; }; then
+		NO_NATIVE_COUNT=0
+		if tun_is_up; then
+			tun_down "network has native IPv6"
+			sleep 2
+			if ! v6_works; then
+				log "native IPv6 is present but broken, ignoring it for $((BROKEN_TTL / 60)) min"
+				BROKEN_KEY=$key
+				BROKEN_UNTIL=$((now + BROKEN_TTL))
+				tun_up "native IPv6 is broken"
+			fi
+		fi
+	else
+		NO_NATIVE_COUNT=$((NO_NATIVE_COUNT + 1))
+		if tun_is_up; then
+			tun_health
+			tun_is_up && mirror_allowed && sc_publish # refresh the mirror if the network changed
+		elif [ "$NO_NATIVE_COUNT" -ge "$UP_CONFIRM" ]; then
+			tun_up "no native IPv6 on $key"
+		else
+			NEXT_TIMEOUT=6 # confirm in a few seconds, the router advertisement may be late
+		fi
+	fi
+
+	# after a macOS update: self-test once things have settled
+	if [ "$SELFTEST_PENDING" = 1 ] && { tun_is_up || native_v6_present; }; then
+		SELFTEST_PENDING=0
+		auto_selftest
+	fi
+}
+
+# --- self-test ------------------------------------------------------------------------------
+
+ST_FAIL=0
+st() { # st "description" command... prints OK/FAIL
+	local name=$1
+	shift
+	if "$@" >/dev/null 2>&1; then
+		echo "  OK    $name"
+	else
+		echo "  FAIL  $name"
+		ST_FAIL=$((ST_FAIL + 1))
+	fi
+}
+t_tools() { command -v wg && command -v wg-quick && command -v wireguard-go && [ "${BASH_VERSINFO[0]}" -ge 4 ]; }
+t_darkwake() { ioreg -n IOPMrootDomain -d1 -r | grep -q '"System Capabilities"'; }
+t_handshake() {
+	local hs=$(wg show "$(tun_ifname)" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
+	[ -n "$hs" ] && [ $(($(date +%s) - hs)) -lt "$HANDSHAKE_MAX" ]
+}
+t_v6_primary() { [ "$(sc_show State:/Network/Global/IPv6 | awk '$1=="PrimaryInterface"{print $3}')" = "$(tun_ifname)" ]; }
+t_aaaa() { scutil --dns | awk '/^resolver #1/{f=1} f && /flags/ {print; exit}' | grep -q AAAA; }
+# default DNS = DNS of the real network (first server vs the scoped resolver of the interface)
+t_dns_real() {
+	local def real
+	def=$(scutil --dns | awk '/^resolver #1/{f=1} f && /nameserver\[0\]/ {print $3; exit}')
+	real=$(scutil --dns | awk -v i="($(primary_if))" '
+		/for scoped queries/ {s=1}
+		s && /^resolver/ {n=""}
+		s && /nameserver\[0\]/ {n=$3}
+		s && index($0, i) {print n; exit}')
+	[ -n "$def" ] && [ "$def" = "$real" ]
+}
+t_v6_auto() { curl -s -m 8 -o /dev/null -w '%{remote_ip}' https://www.google.com | grep -q :; }
+t_ext_v6() {
+	local a=$(ifconfig "$(tun_ifname)" | awk '$1=="inet6" && $2 !~ /^fe80/ {print $2; exit}')
+	[ -n "$a" ] && [ "$(curl -6 -s -m 8 https://api6.ipify.org)" = "$a" ]
+}
+t_tun_off() { [ ! -f "/var/run/wireguard/$NAME.name" ]; }
+
+selftest() {
+	ST_FAIL=0
+	echo "macOS $(sw_vers -productVersion) ($(macos_build)), $(date '+%F %T')"
+	echo "Tools:"
+	st "wg, wg-quick, wireguard-go, bash 4+" t_tools
+	st "config $CONF" test -r "$CONF"
+	st "dark wake flag is readable" t_darkwake
+	echo "Network:"
+	st "real network service found" test -n "$(real_svc)"
+	st "interface and router: $(primary_if) / $(router4)" net_ready
+	st "IPv4 internet" curl -4 -s -m 6 -o /dev/null https://www.google.com
+	if native_v6_present; then
+		echo "The network has native IPv6, no tunnel needed:"
+		st "native IPv6 works" v6_works
+		st "tunnel is down" t_tun_off
+	elif [ -n "$(other_vpn)" ]; then
+		echo "Another VPN is connected ($(other_vpn)), the tunnel steps aside."
+	else
+		echo "Tunnel:"
+		st "up ($(tun_ifname))" tun_is_up
+		st "recent handshake" t_handshake
+		st "ping6 through the tunnel" v6_works
+		echo "IPv6 registered in the system:"
+		if [ "$MIRROR" != yes ]; then
+			echo "  --    disabled in settings (MIRROR=no)"
+		elif ! mirror_allowed; then
+			echo "  FAIL  disabled by the safety fuse on this macOS build"
+			ST_FAIL=$((ST_FAIL + 1))
+		else
+			st "primary IPv6 is the tunnel" t_v6_primary
+			st "IPv4 stayed on $(primary_if)" v4_on_real_iface
+			st "DNS asks for AAAA" t_aaaa
+			st "DNS servers come from the real network" t_dns_real
+			st "websites use IPv6 on their own" t_v6_auto
+			st "external IPv6 = tunnel address" t_ext_v6
+		fi
+	fi
+	if [ "$ST_FAIL" = 0 ]; then echo "Result: all good"; else echo "Result: $ST_FAIL problem(s)"; fi
+	return "$ST_FAIL"
+}
+
+auto_selftest() {
+	local out rc
+	out=$(selftest 2>&1)
+	rc=$?
+	echo "$out" | sed 's/^/  /' >>"$LOG"
+	macos_build >"$BUILD_FILE"
+	if [ "$rc" = 0 ]; then
+		notify "macOS was updated ($(sw_vers -productVersion)). IPv6 tunnel checked, all good"
+	else
+		notify "macOS was updated ($(sw_vers -productVersion)). Self-test found $rc problem(s). Details: sudo ipv6-auto selftest"
+	fi
+}
+
+status() {
+	echo "Network:         $(net_key)"
+	if full_wake; then echo "Sleep:           no"; else echo "Sleep:           dark wake"; fi
+	if native_v6_present; then echo "Native IPv6:     yes"; else echo "Native IPv6:     no"; fi
+	[ -n "$(other_vpn)" ] && echo "Other VPN:       $(other_vpn) (tunnel steps aside)"
+	if tun_is_up; then
+		echo "Tunnel:          up ($(tun_ifname))"
+		wg show "$(tun_ifname)" 2>/dev/null | grep -E 'endpoint|handshake|transfer' | sed 's/^ */  /'
+	else
+		echo "Tunnel:          down"
+	fi
+	echo "System IPv6:     $(sc_show State:/Network/Global/IPv6 | awk '/PrimaryInterface/{print $3}')"
+	if t_aaaa; then echo "DNS AAAA:        requested"; else echo "DNS AAAA:        not requested"; fi
+	printf "External IPv6:   "
+	curl -6 -s -m 5 https://api6.ipify.org || printf "none"
+	echo
+}
+
+daemon() {
+	local MAIN=$$ p
+	# kill copies from previous runs (orphaned pipeline parts can survive a stop)
+	for p in $(pgrep -f '/usr/local/sbin/ipv6-auto daemon'); do
+		[ "$p" != "$MAIN" ] && kill "$p" 2>/dev/null
+	done
+	pkill -P 1 -x scutil 2>/dev/null # orphaned n.watch from old copies
+	log "daemon started"
+	sc_unpublish # start from a clean state after a crash or restart
+	if [ "$(cat "$BUILD_FILE" 2>/dev/null)" != "$(macos_build)" ]; then
+		SELFTEST_PENDING=1
+		log "macOS build changed ($(cat "$BUILD_FILE" 2>/dev/null || echo none) -> $(macos_build)), self-test after the network settles"
+	fi
+	# On stop leave the tunnel alone (wireguard-go lives on its own), kill only our pipeline
+	trap 'log "daemon stopped"; pkill -P $MAIN 2>/dev/null; exit 0' TERM INT
+	# macOS tells us about network changes and wake-ups: scutil sits in n.watch and uses no CPU.
+	# Our own keys (Service/ipv6-auto) are not watched so we do not wake ourselves up.
+	# Every part of the pipeline exits by itself if the main process is gone.
+	{
+		printf '%s\n' 'n.add State:/Network/Global/IPv4' \
+			'n.add State:/Network/Interface/[^/]+/IPv6 pattern' \
+			'n.add State:/Network/Interface/[^/]+/IPv4 pattern' 'n.watch'
+		while kill -0 "$MAIN" 2>/dev/null; do sleep 600; done
+	} | scutil | {
+		check
+		while :; do
+			read -r -t "$NEXT_TIMEOUT" _
+			rc=$?
+			kill -0 "$MAIN" 2>/dev/null || exit 0
+			if [ $rc -eq 0 ]; then
+				# a burst of events when reconnecting: wait until the network settles
+				sleep 3
+				while read -r -t 1 _; do :; done
+				check
+			elif [ $rc -gt 128 ]; then
+				check # timeout: sanity check or a postponed check
+			else
+				log "scutil exited, restarting the daemon"
+				exit 1
+			fi
+		done
+	} &
+	wait $! # background + wait so the trap fires right away
+	exit 1  # pipeline died, launchd starts us again
+}
+
+case "${1:-}" in
+daemon) daemon ;;
+check) check ;;
+status) status ;;
+selftest) selftest ;;
+cleanup)
+	sc_unpublish
+	[ -f "/var/run/wireguard/$NAME.name" ] && wg-quick down "$CONF" >/dev/null 2>&1
+	rm -f "/var/run/wireguard/$NAME.name"
+	;;
+*)
+	echo "usage: $0 daemon|status|selftest|check|cleanup"
+	exit 1
+	;;
+esac
