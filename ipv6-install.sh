@@ -3,7 +3,7 @@
 # Automatic IPv6 for macOS: WireGuard tunnel when the network has no IPv6
 # https://github.com/a0s/ipv6-install
 
-readonly VERSION="0.1.1"
+readonly VERSION="0.1.2"
 readonly REPO_RAW="https://raw.githubusercontent.com/a0s/ipv6-install/master"
 readonly ETC_DIR="/usr/local/etc/ipv6-auto"
 readonly CONF="${ETC_DIR}/wg6.conf"
@@ -253,10 +253,7 @@ function writeConfig() {
 	chmod 600 "${CONF}"
 }
 
-function installIPv6Auto() {
-	installQuestions
-	installDeps
-
+function installDaemon() {
 	local tmp
 	tmp=$(mktemp)
 	fetchDaemon "${tmp}"
@@ -266,6 +263,23 @@ function installIPv6Auto() {
 		"${tmp}" >"${BIN}"
 	chmod 755 "${BIN}"
 	rm -f "${tmp}"
+}
+
+# Replace the daemon with the current version, keep the config and settings
+function updateIPv6Auto() {
+	installDeps
+	stopService
+	installDaemon
+	writePlist
+	startService
+	echo -e "${GREEN}ipv6-auto updated to ${VERSION}, service restarted.${NC}"
+}
+
+function installIPv6Auto() {
+	installQuestions
+	installDeps
+
+	installDaemon
 
 	writeConfig
 	cat >"${PARAMS}" <<EOF
@@ -333,19 +347,21 @@ function manageMenu() {
 	echo "   1) Show status"
 	echo "   2) Run self-test"
 	echo "   3) Replace the tunnel config"
-	echo "   4) Reinstall (ask the questions again)"
-	echo "   5) Remove ipv6-auto"
-	echo "   6) Exit"
-	until [[ ${MENU_OPTION} =~ ^[1-6]$ ]]; do
-		read -rp "Select an option [1-6]: " MENU_OPTION
+	echo "   4) Update to this version (keeps the config)"
+	echo "   5) Reinstall (ask the questions again)"
+	echo "   6) Remove ipv6-auto"
+	echo "   7) Exit"
+	until [[ ${MENU_OPTION} =~ ^[1-7]$ ]]; do
+		read -rp "Select an option [1-7]: " MENU_OPTION
 	done
 	case "${MENU_OPTION}" in
 	1) "${BIN}" status ;;
 	2) "${BIN}" selftest ;;
 	3) replaceConfig ;;
-	4) installIPv6Auto ;;
-	5) uninstallIPv6Auto ;;
-	6) exit 0 ;;
+	4) updateIPv6Auto ;;
+	5) installIPv6Auto ;;
+	6) uninstallIPv6Auto ;;
+	7) exit 0 ;;
 	esac
 }
 
@@ -355,8 +371,13 @@ case "${1:-}" in
 	exit 0
 	;;
 --help | -h)
-	echo "usage: sudo $0 [--uninstall | --version]"
+	echo "usage: sudo $0 [--update | --uninstall | --version]"
 	echo "Without options: install, or show the management menu if already installed."
+	exit 0
+	;;
+--update)
+	initialCheck
+	if [[ -e ${PLIST} ]]; then updateIPv6Auto; else echo "ipv6-auto is not installed"; fi
 	exit 0
 	;;
 --uninstall)

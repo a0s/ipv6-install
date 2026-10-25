@@ -35,13 +35,15 @@ YIELD_TO_VPN=yes  # take the tunnel down while another system VPN is connected
 IDLE_CHECK=300    # sanity check every 5 minutes when nothing happens
 SOON=30           # "check again soon" (dark wake, network not ready)
 UP_CONFIRM=2      # checks in a row without IPv6 before the tunnel goes up
-BROKEN_TTL=1800   # native IPv6 that does not work is ignored for 30 minutes
+BROKEN_TTL=1800   # native IPv6 is re-checked every 30 minutes, working or broken
 HANDSHAKE_MAX=180 # restart the tunnel after this long without a handshake
 TEST_HOST=2001:4860:4860::8888
 # shellcheck source=/dev/null
 [ -r "$PARAMS" ] && . "$PARAMS"
 
 BROKEN_KEY=""
+VERIFIED_KEY=""
+VERIFIED_UNTIL=0
 BROKEN_UNTIL=0
 NO_NATIVE_COUNT=0
 LAST_RESTART=0
@@ -124,7 +126,24 @@ native_v6_present() {
 	netstat -rn -f inet6 2>/dev/null | awk -v i="$ifc" '$1=="default" && $NF==i {f=1} END {exit !f}'
 }
 
-v6_works() { ping6 -c 2 -i 0.5 -t 4 "$TEST_HOST" >/dev/null 2>&1 || curl -6 -s -m 5 -o /dev/null https://ipv6.google.com; }
+# IPv6 works by the normal routes (through the tunnel when it is up)
+v6_works() { ping6 -c 2 -i 0.5 "$TEST_HOST" >/dev/null 2>&1 || curl -6 -s -m 5 -o /dev/null https://ipv6.google.com; }
+
+# Native IPv6 works, tested through the real interface, so the tunnel stays untouched while we look.
+# ping6 -B and curl --interface bind to the interface and ignore the tunnel routes.
+native_works() {
+	local ifc=$(primary_if)
+	ping6 -B "$ifc" -c 2 -i 0.5 "$TEST_HOST" >/dev/null 2>&1 ||
+		curl -6 -s -m 5 --interface "$ifc" -o /dev/null https://ipv6.google.com
+}
+# $1=1: one retry after 3 s (a fresh network may be slow). $1=2: must pass twice in a row.
+native_works_n() {
+	if [ "$1" = 2 ]; then
+		native_works && sleep 5 && native_works
+	else
+		native_works || { sleep 3 && native_works; }
+	fi
+}
 
 tun_ifname() { cat "/var/run/wireguard/$NAME.name" 2>/dev/null; }
 tun_is_up() {
@@ -271,6 +290,16 @@ tun_down() {
 	NEXT_TRY=0
 }
 
+# Make sure the tunnel is up and healthy, and the mirror is current
+keep_tunnel() {
+	if tun_is_up; then
+		tun_health
+		tun_is_up && mirror_allowed && sc_publish
+	else
+		tun_up "$1"
+	fi
+}
+
 # Restart a stuck tunnel (e.g. the network changed and handshakes stopped)
 tun_health() {
 	local i=$(tun_ifname) now=$(date +%s) hs
@@ -305,16 +334,26 @@ check() {
 		return
 	fi
 
-	if native_v6_present && ! { [ "$key" = "$BROKEN_KEY" ] && [ "$now" -lt "$BROKEN_UNTIL" ]; }; then
+	if native_v6_present; then
 		NO_NATIVE_COUNT=0
-		if tun_is_up; then
-			tun_down "network has native IPv6"
-			sleep 2
-			if ! v6_works; then
-				log "native IPv6 is present but broken, ignoring it for $((BROKEN_TTL / 60)) min"
+		if [ "$key" = "$BROKEN_KEY" ] && [ "$now" -lt "$BROKEN_UNTIL" ]; then
+			keep_tunnel "native IPv6 on $key is broken"
+		elif [ "$key" != "$VERIFIED_KEY" ] || [ "$now" -ge "$VERIFIED_UNTIL" ] || tun_is_up; then
+			# An address and a route are not proof: plenty of routers hand out IPv6 that goes
+			# nowhere. A network that failed before has to pass twice in a row.
+			local need=1
+			[ "$key" = "$BROKEN_KEY" ] && need=2
+			if native_works_n "$need"; then
+				[ "$key" != "$VERIFIED_KEY" ] && log "native IPv6 works on $key"
+				VERIFIED_KEY=$key
+				VERIFIED_UNTIL=$((now + BROKEN_TTL)) # quiet re-check later, uplinks die too
+				BROKEN_KEY=""
+				tun_is_up && tun_down "network has working native IPv6"
+			else
+				log "native IPv6 on $key does not work, using the tunnel, next check in $((BROKEN_TTL / 60)) min"
 				BROKEN_KEY=$key
 				BROKEN_UNTIL=$((now + BROKEN_TTL))
-				tun_up "native IPv6 is broken"
+				keep_tunnel "native IPv6 is broken"
 			fi
 		fi
 	else
@@ -386,13 +425,14 @@ selftest() {
 	st "real network service found" test -n "$(real_svc)"
 	st "interface and router: $(primary_if) / $(router4)" net_ready
 	st "IPv4 internet" curl -4 -s -m 6 -o /dev/null https://www.google.com
-	if native_v6_present; then
-		echo "The network has native IPv6, no tunnel needed:"
-		st "native IPv6 works" v6_works
+	if native_v6_present && native_works; then
+		echo "The network has working native IPv6, no tunnel needed:"
+		st "native IPv6 works" native_works
 		st "tunnel is down" t_tun_off
 	elif [ -n "$(other_vpn)" ]; then
 		echo "Another VPN is connected ($(other_vpn)), the tunnel steps aside."
 	else
+		native_v6_present && echo "The network has IPv6, but it does not work. Using the tunnel."
 		echo "Tunnel:"
 		st "up ($(tun_ifname))" tun_is_up
 		st "recent handshake" t_handshake

@@ -30,7 +30,8 @@ sudo bash ipv6-install.sh
 
 It asks where the config is and how you want IPv6 used, installs the `ipv6-auto` LaunchDaemon
 and runs a self-test at the end. Run it again to see status, run the self-test, swap the config
-or remove everything. `sudo bash ipv6-install.sh --uninstall` removes it without the menu.
+or remove everything. `--update` installs a newer daemon and keeps your config, `--uninstall`
+removes it without the menu.
 
 With Homebrew:
 
@@ -51,8 +52,11 @@ tail -f /var/log/ipv6-auto.log
 
 The daemon sleeps until macOS reports a network change, plus one sanity check every five
 minutes, so it costs nothing on battery. It waits a few seconds after you connect, because
-routers often announce IPv6 a moment after IPv4. If a network claims IPv6 but it doesn't work,
-the tunnel comes back and that network is ignored for 30 minutes. While another system VPN is
+routers often announce IPv6 a moment after IPv4. An IPv6 address and route are not enough to
+trust a network, because plenty of routers hand out IPv6 that goes nowhere. So the daemon pings a
+real IPv6 host through the Wi-Fi interface itself, which works even while the tunnel is up. If
+that fails, the tunnel stays. Every 30 minutes it quietly checks again, and a network that failed
+once has to pass twice in a row before the tunnel goes away. While another system VPN is
 connected (a WireGuard.app tunnel, say), the tunnel steps aside. During dark wake (Power Nap)
 and while the network is still coming up, it changes nothing.
 
