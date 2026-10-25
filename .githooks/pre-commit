@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck and shfmt on staged shell scripts
+# Lint staged shell scripts with shellcheck and shfmt
 files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '(\.sh|^ipv6-auto)$')
 [ -z "$files" ] && exit 0
 rc=0
