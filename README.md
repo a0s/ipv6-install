@@ -92,9 +92,10 @@ comes up, but apps only use it for IPv6-only hosts.
 Sites that have both IPv4 and IPv6 will go through the tunnel PoP, so pick one close to where
 you usually are. Networks that block all UDP except 53 and 443 block WireGuard too.
 
-The tunnel runs with MTU 1280, the IPv6 minimum, unless your config sets its own `MTU`. The
-wg-quick default (1380–1420) is too big for phone hotspots and some cellular links: oversized
-packets vanish silently, TCP copes, but QUIC (HTTP/3, most of Google) hangs.
+The tunnel runs with MTU 1280, the IPv6 minimum: a bigger or missing `MTU` in the config is
+replaced, a smaller one is kept. The wg-quick default (1380–1420) and what providers ship
+(Route64: 1380) are too big for phone hotspots and some cellular links: oversized packets vanish
+silently, TCP copes, but QUIC (HTTP/3, most of Google) hangs.
 
 ## Contributing
 

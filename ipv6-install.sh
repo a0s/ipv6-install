@@ -3,7 +3,7 @@
 # Automatic IPv6 for macOS: WireGuard tunnel when the network has no IPv6
 # https://github.com/a0s/ipv6-install
 
-readonly VERSION="0.1.6"
+readonly VERSION="0.1.7"
 readonly REPO_RAW="https://raw.githubusercontent.com/a0s/ipv6-install/master"
 readonly ETC_DIR="/usr/local/etc/ipv6-auto"
 readonly CONF="${ETC_DIR}/wg6.conf"

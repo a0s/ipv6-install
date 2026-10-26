@@ -38,7 +38,7 @@ UP_CONFIRM=2      # checks in a row without IPv6 before the tunnel goes up
 BROKEN_TTL=1800   # native IPv6 is re-checked every 30 minutes, working or broken
 HANDSHAKE_MAX=180 # restart the tunnel after this long without a handshake
 TEST_HOST=2001:4860:4860::8888
-TUN_MTU=1280 # MTU written into the config when it sets none (see ensure_mtu)
+TUN_MTU=1280 # max tunnel MTU, a bigger or missing one in the config is replaced (see ensure_mtu)
 # shellcheck source=/dev/null
 [ -r "$PARAMS" ] && . "$PARAMS"
 
@@ -57,7 +57,8 @@ SELFTEST_PENDING=0
 
 log() {
 	echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null
-	[ "$(stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ] && mv -f "$LOG" "$LOG.1"
+	if [ "$(stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then mv -f "$LOG" "$LOG.1"; fi
+	return 0
 }
 # Log why a check was skipped, but only when the reason changes
 skip() {
@@ -319,17 +320,25 @@ tun_up() {
 	fi
 }
 
-# wg-quick picks the MTU as "outer interface MTU - 80", i.e. 1420 or 1380. Phone hotspots and
-# cellular links carry less, and packets in between are dropped without an ICMP error. TCP
-# survives, but QUIC (HTTP/3, most of Google) stalls. 1280 is the IPv6 minimum and fits
-# everywhere. A config that sets its own MTU is left alone.
-has_mtu() { grep -Eqi '^[[:space:]]*MTU[[:space:]]*=' "$CONF"; }
+# The tunnel MTU must fit phone hotspots and cellular links. Both the wg-quick default ("outer
+# interface MTU - 80", 1380-1420) and what providers put into configs (Route64: MTU = 1380) are
+# too big there, and packets in between are dropped without an ICMP error. TCP survives, but QUIC
+# (HTTP/3, most of Google) stalls. 1280 is the IPv6 minimum and fits everywhere, so a bigger or
+# missing MTU becomes 1280. A smaller one is left alone.
+conf_mtu() { awk -F' *= *' 'tolower($1) ~ /^[[:space:]]*mtu$/ {print $2+0; exit}' "$CONF"; }
+
+mtu_ok() {
+	local m=$(conf_mtu)
+	[ -n "$m" ] && [ "$m" -le "$TUN_MTU" ]
+}
 
 ensure_mtu() {
-	has_mtu && return 0
-	sed -i '' -E "/^\[Interface\]/a\\
+	mtu_ok && return 0
+	local old=$(conf_mtu)
+	sed -i '' -E -e '/^[[:space:]]*[Mm][Tt][Uu][[:space:]]*=/d' -e "/^\[Interface\]/a\\
 MTU = $TUN_MTU
-" "$CONF" && log "added MTU = $TUN_MTU to $CONF"
+" "$CONF" || return 1
+	log "MTU in $CONF: ${old:-none} -> $TUN_MTU"
 }
 
 tun_down() {
@@ -343,10 +352,6 @@ tun_down() {
 
 # Make sure the tunnel is up and healthy, and the mirror is current
 keep_tunnel() {
-	# a tunnel brought up before ensure_mtu existed keeps the old MTU until it is recreated
-	if tun_is_up && ! has_mtu; then
-		tun_down "config has no MTU"
-	fi
 	if tun_is_up; then
 		tun_health
 		tun_is_up && mirror_allowed && sc_publish
@@ -358,6 +363,12 @@ keep_tunnel() {
 # Restart a stuck tunnel (e.g. the network changed and handshakes stopped)
 tun_health() {
 	local i=$(tun_ifname) now=$(date +%s) hs
+	# a tunnel brought up before ensure_mtu existed keeps the old MTU until it is recreated
+	if [ -f "$CONF" ] && ! mtu_ok && ensure_mtu; then
+		tun_down "MTU changed in the config"
+		tun_up "MTU changed in the config"
+		return
+	fi
 	[ $((now - LAST_RESTART)) -lt "$HANDSHAKE_MAX" ] && return
 	hs=$(wg show "$i" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
 	if [ -z "$hs" ] || [ "$hs" = 0 ] || [ $((now - hs)) -gt "$HANDSHAKE_MAX" ]; then
