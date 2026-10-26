@@ -38,6 +38,7 @@ UP_CONFIRM=2      # checks in a row without IPv6 before the tunnel goes up
 BROKEN_TTL=1800   # native IPv6 is re-checked every 30 minutes, working or broken
 HANDSHAKE_MAX=180 # restart the tunnel after this long without a handshake
 TEST_HOST=2001:4860:4860::8888
+TUN_MTU=1280 # MTU written into the config when it sets none (see ensure_mtu)
 # shellcheck source=/dev/null
 [ -r "$PARAMS" ] && . "$PARAMS"
 
@@ -288,6 +289,7 @@ tun_up() {
 		return 1
 	}
 	log "bringing the tunnel up ($1)"
+	ensure_mtu
 	# leftovers from a previous run (wireguard-go killed, name file left) break wg-quick up
 	[ -f "/var/run/wireguard/$NAME.name" ] && wg-quick down "$CONF" >/dev/null 2>&1
 	rm -f "/var/run/wireguard/$NAME.name"
@@ -317,6 +319,19 @@ tun_up() {
 	fi
 }
 
+# wg-quick picks the MTU as "outer interface MTU - 80", i.e. 1420 or 1380. Phone hotspots and
+# cellular links carry less, and packets in between are dropped without an ICMP error. TCP
+# survives, but QUIC (HTTP/3, most of Google) stalls. 1280 is the IPv6 minimum and fits
+# everywhere. A config that sets its own MTU is left alone.
+has_mtu() { grep -Eqi '^[[:space:]]*MTU[[:space:]]*=' "$CONF"; }
+
+ensure_mtu() {
+	has_mtu && return 0
+	sed -i '' -E "/^\[Interface\]/a\\
+MTU = $TUN_MTU
+" "$CONF" && log "added MTU = $TUN_MTU to $CONF"
+}
+
 tun_down() {
 	sc_unpublish
 	[ -f "/var/run/wireguard/$NAME.name" ] || return 0
@@ -328,6 +343,10 @@ tun_down() {
 
 # Make sure the tunnel is up and healthy, and the mirror is current
 keep_tunnel() {
+	# a tunnel brought up before ensure_mtu existed keeps the old MTU until it is recreated
+	if tun_is_up && ! has_mtu; then
+		tun_down "config has no MTU"
+	fi
 	if tun_is_up; then
 		tun_health
 		tun_is_up && mirror_allowed && sc_publish
