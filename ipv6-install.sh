@@ -3,7 +3,7 @@
 # Automatic IPv6 for macOS: WireGuard tunnel when the network has no IPv6
 # https://github.com/a0s/ipv6-install
 
-readonly VERSION="0.1.3"
+readonly VERSION="0.1.4"
 readonly REPO_RAW="https://raw.githubusercontent.com/a0s/ipv6-install/master"
 readonly ETC_DIR="/usr/local/etc/ipv6-auto"
 readonly CONF="${ETC_DIR}/wg6.conf"
@@ -271,6 +271,8 @@ function updateIPv6Auto() {
 	stopService
 	installDaemon
 	writePlist
+	# a new version deserves a fresh try: the fuse blows again by itself if needed
+	rm -f "${ETC_DIR}/mirror-disabled"
 	startService
 	echo -e "${GREEN}ipv6-auto updated to ${VERSION}, service restarted.${NC}"
 }

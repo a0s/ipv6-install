@@ -185,10 +185,23 @@ v4_on_real_iface() {
 	[ -n "$ifc" ] && [ "$g" = "$ifc" ] && [ "$d" = "$ifc" ]
 }
 
+# Metered network (iPhone hotspot, cellular). macOS always "couples" IPv4 and IPv6 of such a
+# service to one interface (configd IPMonitor treats expensive services as coupled), so a primary
+# IPv6 on the tunnel pushes IPv4 off the real network. The mirror is not used there.
+iface_expensive() { sc_show "State:/Network/Interface/$1/Link" | awk '$1=="Expensive" && $3=="TRUE" {f=1} END {exit !f}'; }
+
 mirror_allowed() { [ "$MIRROR" = yes ] && [ "$(cat "$MIRROR_OFF" 2>/dev/null)" != "$(macos_build)" ]; }
 
 sc_publish() {
-	local s=$(real_svc) i=$(tun_ifname) a src sig cmds e k
+	local s=$(real_svc) i=$(tun_ifname) ifc=$(primary_if) a src sig cmds e k
+	if iface_expensive "$ifc"; then
+		if [ "$MIRROR_SIG" != expensive ]; then
+			sc_unpublish
+			log "$ifc is a metered network (iPhone hotspot?): macOS keeps IPv4 and IPv6 on one interface there, the tunnel only serves explicit IPv6 addresses"
+		fi
+		MIRROR_SIG=expensive
+		return 0
+	fi
 	a=$(ifconfig "$i" 2>/dev/null | awk '$1=="inet6" && $2 !~ /^fe80/ {print $2; exit}')
 	[ -n "$s" ] && [ -n "$a" ] || return 1
 	src=$(mirror_sources "$s")
@@ -222,7 +235,7 @@ d.add Router ${a%::*}::1
 d.add OverridePrimary # 1
 set State:/Network/Service/$SC_KEY/IPv6
 EOF
-	[ -z "$MIRROR_SIG" ] && log "tunnel IPv6 registered in the system (network service $s)"
+	{ [ -z "$MIRROR_SIG" ] || [ "$MIRROR_SIG" = expensive ]; } && log "tunnel IPv6 registered in the system (network service $s)"
 	MIRROR_SIG=$sig
 	# Safety fuse: IPv4 must stay on the real network. If a new macOS behaves differently,
 	# roll back right away and do not try again on this macOS build. Give macOS a few seconds
@@ -234,6 +247,11 @@ EOF
 		v4_on_real_iface && return 0
 		if [ "$(real_svc)" != "$s" ]; then
 			MIRROR_SIG=""
+			return 0
+		fi
+		# the network turned out to be metered: not a macOS change, just step back
+		if iface_expensive "$(primary_if)"; then
+			sc_unpublish
 			return 0
 		fi
 	done
@@ -458,6 +476,8 @@ selftest() {
 		echo "IPv6 registered in the system:"
 		if [ "$MIRROR" != yes ]; then
 			echo "  --    disabled in settings (MIRROR=no)"
+		elif iface_expensive "$(primary_if)"; then
+			echo "  --    not used: $(primary_if) is a metered network, apps use the tunnel for explicit IPv6 only"
 		elif ! mirror_allowed; then
 			echo "  FAIL  disabled by the safety fuse on this macOS build"
 			ST_FAIL=$((ST_FAIL + 1))
@@ -499,6 +519,7 @@ status() {
 		echo "Tunnel:          down"
 	fi
 	echo "System IPv6:     $(sc_show State:/Network/Global/IPv6 | awk '/PrimaryInterface/{print $3}')"
+	iface_expensive "$(primary_if)" && echo "Metered network: yes (tunnel serves explicit IPv6 only)"
 	if t_aaaa; then echo "DNS AAAA:        requested"; else echo "DNS AAAA:        not requested"; fi
 	printf "External IPv6:   "
 	curl -6 -s -m 5 https://api6.ipify.org || printf "none"

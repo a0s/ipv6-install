@@ -79,6 +79,11 @@ the daemon checks that IPv4 still goes through the real interface. If it doesn't
 within two seconds, stops trying on that macOS build and shows a notification. After each macOS
 update the self-test runs on its own and tells you the result.
 
+On metered networks (an iPhone hotspot, cellular) macOS insists that IPv4 and IPv6 go through
+the same interface, so the daemon does not publish the service there. The tunnel stays up and
+serves explicit IPv6 addresses, and the full setup comes back as soon as you switch to a normal
+network. Updating with `--update` also resets the fuse.
+
 If you'd rather not touch SystemConfiguration, pick mode 2 in the installer. The tunnel still
 comes up, but apps only use it for IPv6-only hosts.
 
